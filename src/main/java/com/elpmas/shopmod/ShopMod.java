@@ -2,15 +2,22 @@ package com.elpmas.shopmod;
 
 // TODO: TODO練習
 import com.elpmas.shopmod.item.ShopItems;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.reflect.TypeToken;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.logging.LogUtils;
+import com.robertx22.mine_and_slash.capability.entity.EntityData;
 import com.robertx22.mine_and_slash.mmorpg.MMORPG;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.inventory.InventoryScreen;
+import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.item.Item;
 import net.minecraftforge.api.distmarker.Dist;
@@ -23,6 +30,7 @@ import net.minecraftforge.event.BuildCreativeModeTabContentsEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartingEvent;
+import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
@@ -32,15 +40,25 @@ import net.minecraft.world.item.Items;
 import net.minecraftforge.event.entity.living.LivingEvent;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+import net.minecraftforge.fml.loading.FMLPaths;
+import net.minecraftforge.network.NetworkDirection;
+import net.minecraftforge.network.NetworkEvent;
+import net.minecraftforge.network.NetworkRegistry;
+import net.minecraftforge.network.simple.SimpleChannel;
 import net.minecraftforge.registries.ForgeRegistries;
 import org.slf4j.Logger;
-import com.mojang.logging.LogUtils; // ロギングのためのインポート
-import net.minecraft.client.renderer.MultiBufferSource;
-import net.minecraft.client.renderer.Rect2i;
-import com.mojang.blaze3d.vertex.PoseStack; // PoseStackのインポート
+
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
-import net.minecraftforge.client.event.RenderGuiEvent;  // これを追加
-import net.minecraftforge.eventbus.api.Event;
+import java.util.UUID;
+import java.util.function.Supplier;
 
 import static com.robertx22.mine_and_slash.mmorpg.registers.common.SlashItemTags.REGULAR_GEMS;
 
@@ -48,10 +66,28 @@ import static com.robertx22.mine_and_slash.mmorpg.registers.common.SlashItemTags
 @Mod(ShopMod.MOD_ID)
 public class ShopMod {
     public static final String MOD_ID = "shopmod";
-    private static final Logger LOGGER = LogUtils.getLogger();
+    public static final Logger LOGGER = LogUtils.getLogger();
 
+    private static final String PROTOCOL_VERSION = "1";
+    public static final SimpleChannel INSTANCE = NetworkRegistry.newSimpleChannel(
+            new ResourceLocation("shopmod", "main"),
+            () -> PROTOCOL_VERSION,
+            PROTOCOL_VERSION::equals,
+            PROTOCOL_VERSION::equals
+    );
+
+    private static Map<UUID, Long> playerMoneyMap = new HashMap<>();
+    private static final String MONEY_FILE = "player_moneys.json";
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private final Path configPath;
 
     public ShopMod() {
+        MinecraftForge.EVENT_BUS.register(this);
+        INSTANCE.registerMessage(0, MoneyUpdatePacket.class, MoneyUpdatePacket::encode, MoneyUpdatePacket::decode, MoneyUpdatePacket::handle);
+
+        configPath = FMLPaths.CONFIGDIR.get().resolve(MOD_ID);
+        configPath.toFile().mkdirs();
+
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
 
         modEventBus.addListener(this::commonSetup);
@@ -67,14 +103,93 @@ public class ShopMod {
         FMLJavaModLoadingContext.get().getModEventBus().addListener(this::commonSetup);
     }
 
+    @SubscribeEvent
+    public void onServerStarting(ServerStartingEvent event) {
+        loadPlayerMoney();
+    }
+
+    @SubscribeEvent
+    public void onServerStopping(ServerStoppingEvent event) {
+        savePlayerMoney();
+    }
+
+    private void loadPlayerMoney() {
+        File file = configPath.resolve(MONEY_FILE).toFile();
+        if (file.exists()) {
+            try (FileReader reader = new FileReader(file)) {
+                Type type = new TypeToken<Map<UUID, Long>>(){}.getType();
+                playerMoneyMap = GSON.fromJson(reader, type);
+                LOGGER.info("Loaded player money data from {}", file.getAbsolutePath());
+            } catch (IOException e) {
+                LOGGER.error("Failed to load player money data", e);
+            }
+        } else {
+            LOGGER.info("No existing player money data found at {}", file.getAbsolutePath());
+        }
+    }
+
+    private void savePlayerMoney() {
+        File file = configPath.resolve(MONEY_FILE).toFile();
+        try (FileWriter writer = new FileWriter(file)) {
+            GSON.toJson(playerMoneyMap, writer);
+            LOGGER.info("Saved player money data to {}", file.getAbsolutePath());
+        } catch (IOException e) {
+            LOGGER.error("Failed to save player money data", e);
+        }
+    }
+
+    @SubscribeEvent
+    public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+        LOGGER.info("Player logged in: {}", event.getEntity().getName().getString());
+        if (event.getEntity() instanceof ServerPlayer) {
+            ServerPlayer player = (ServerPlayer) event.getEntity();
+            long money = playerMoneyMap.getOrDefault(player.getUUID(), 0L);
+            LOGGER.info("Sending money update to player: {}", money);
+            INSTANCE.sendTo(new MoneyUpdatePacket(money), player.connection.connection, NetworkDirection.PLAY_TO_CLIENT);
+        }
+    }
+
+    public static void setPlayerMoney(Player player, long amount) {
+        playerMoneyMap.put(player.getUUID(), amount);
+        if (player instanceof ServerPlayer) {
+            INSTANCE.sendTo(new MoneyUpdatePacket(amount), ((ServerPlayer) player).connection.connection, NetworkDirection.PLAY_TO_CLIENT);
+        }
+    }
+
+    public static long getPlayerMoney(Player player) {
+        return playerMoneyMap.getOrDefault(player.getUUID(), 0L);
+    }
+
+    public static class MoneyUpdatePacket {
+        private final long money;
+
+        public MoneyUpdatePacket(long money) {
+            this.money = money;
+        }
+
+        public static void encode(MoneyUpdatePacket packet, FriendlyByteBuf buffer) {
+            buffer.writeLong(packet.money);
+        }
+
+        public static MoneyUpdatePacket decode(FriendlyByteBuf buffer) {
+            return new MoneyUpdatePacket(buffer.readLong());
+        }
+
+        public static void handle(MoneyUpdatePacket packet, Supplier<NetworkEvent.Context> ctx) {
+            ctx.get().enqueueWork(() -> {
+                Player player = ctx.get().getSender();
+                if (player != null) {
+                    playerMoneyMap.put(player.getUUID(), packet.money);
+                }
+            });
+            ctx.get().setPacketHandled(true);
+        }
+    }
+
     private void commonSetup(final FMLCommonSetupEvent event) {
     }
 
     private void addCreative(BuildCreativeModeTabContentsEvent event) {
-    }
-
-    @SubscribeEvent
-    public void onServerStarting(ServerStartingEvent event) {
     }
 
     @SubscribeEvent
@@ -102,38 +217,10 @@ public class ShopMod {
                 }
             }
 
-            MoneyEvents.money = MoneyEvents.money -10;
-            LOGGER.info("Player {} money: {}円", player.getName().getString(), MoneyEvents.money);
-        }
-    }
-
-    @Mod.EventBusSubscriber(modid = MOD_ID, bus = Mod.EventBusSubscriber.Bus.FORGE, value = Dist.CLIENT)
-    public static class MoneyEvents {
-
-        private static int money = 1000;
-
-        @SubscribeEvent
-        public static void onPlayerJoin(PlayerEvent.PlayerLoggedInEvent event) {
-            Player player = event.getEntity();
-            // プレイヤーがログインした時の処理（必要に応じてカスタマイズ）
-            LOGGER.info("Player {} has joined with money: {}", player.getName().getString(), money);
-        }
-
-        @SubscribeEvent
-        public static void onDrawScreen(ScreenEvent.Render.Post event) {
-            if (event.getScreen() instanceof InventoryScreen) {
-                Minecraft mc = Minecraft.getInstance();
-                GuiGraphics guiGraphics = event.getGuiGraphics();
-                int width = event.getScreen().width;
-                int height = event.getScreen().height;
-
-                String text = "所持金：" + money;
-                int textWidth = mc.font.width(text);
-                int x = 10;
-                int y = height / 2 - 50;
-
-                guiGraphics.drawString(mc.font, text, x, y, 0xFFFFFF);
-            }
+            LOGGER.info(player.getStringUUID());
+            LOGGER.info(String.valueOf(player.getUUID()));
+            LOGGER.info("Player {} money: {}円", player.getName().getString(), getPlayerMoney(player));
+            setPlayerMoney(player, 1000L);
         }
     }
 }

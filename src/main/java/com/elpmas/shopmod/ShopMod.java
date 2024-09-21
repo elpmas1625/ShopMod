@@ -223,4 +223,21 @@ public class ShopMod {
             setPlayerMoney(player, 1000L);
         }
     }
+
+    @Mod.EventBusSubscriber(modid = MOD_ID, bus = Mod.EventBusSubscriber.Bus.FORGE, value = Dist.CLIENT)
+    public static class ModEventsClient{
+
+        @SubscribeEvent
+        public static void onRenderGameOverlay(ScreenEvent.Render.Post event) {
+            if (event.getScreen() instanceof InventoryScreen) {
+                Minecraft mc = Minecraft.getInstance();
+                Player player = mc.player;
+                if (player != null) {
+                    GuiGraphics guiGraphics = event.getGuiGraphics();
+                    String moneyText = "所持金: " + String.format("%,d", getPlayerMoney(player)) + "円";
+                    guiGraphics.drawString(mc.font, moneyText, 10, 10, 0xFFFFFF);
+                }
+            }
+        }
+    }
 }
